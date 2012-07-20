@@ -1,11 +1,11 @@
+from consts import ZMQ_PUBSUB_KV8_ANNOTATE, pg_connect
+
 import uwsgi
 import zmq
 from datetime import datetime, timedelta
 import psycopg2
 import time
 import simplejson
-
-ZMQ_PUBSUB_KV8_ANNOTATE = "tcp://127.0.0.1:7818"
 
 # Initialize a zeromq CONTEXT
 context = zmq.Context()
@@ -15,7 +15,7 @@ client_annotate.connect(ZMQ_PUBSUB_KV8_ANNOTATE)
 # from const import ZMQ_KV78DEMO
 COMMON_HEADERS = [('Content-Type', 'application/json'), ('Access-Control-Allow-Origin', '*'), ('Access-Control-Allow-Headers', 'Requested-With,Content-Type')]
 
-conn = psycopg2.connect("dbname='gtfs_kv7'")
+conn = psycopg2.connect(pg_connect)
 
 def timestampSplit(unixtime):
     dt = datetime.fromtimestamp(unixtime)
@@ -27,13 +27,16 @@ def timestampSplit(unixtime):
 
     return (operationaldate, seconds)
 
-def getClusters(lat=None, lon=None, radius=None):
-    if lat is None or lon is None:
+def getClusters(lat=None, lon=None, radius=None, name=None):
+    if lat is not None and lon is not None:
+        sql = "select clusters.stop_id, clusters.stop_name, clusters.stop_lon, clusters.stop_lat, s.stop_id, s.stop_name, s.stop_lon, s.stop_lat from (select stop_id, stop_name, stop_lon, stop_lat from gtfs_stops where ST_DWithin(the_geom, st_setsrid(st_makepoint(%s, %s), 4326), %s) and parent_station is null) as clusters, gtfs_stops as s where s.location_type = 0 and (clusters.stop_id = s.parent_station OR clusters.stop_id = s.stop_id);"
+        param = [lon, lat, radius]
+    elif name is not None:
+        sql = "select clusters.stop_id, clusters.stop_name, clusters.stop_lon, clusters.stop_lat, s.stop_id, s.stop_name, s.stop_lon, s.stop_lat from (select stop_id, stop_name, stop_lon, stop_lat from gtfs_stops where stop_name ilike %s and parent_station is null) as clusters, gtfs_stops as s where s.location_type = 0 and (clusters.stop_id = s.parent_station OR clusters.stop_id = s.stop_id);"
+        param = ['%' + name + '%']
+    else:
         sql = "select clusters.stop_id, clusters.stop_name, clusters.stop_lon, clusters.stop_lat, s.stop_id, s.stop_name, s.stop_lon, s.stop_lat from gtfs_stops as clusters, gtfs_stops as s where clusters.parent_station is null and s.location_type = 0 and (clusters.stop_id = s.parent_station OR clusters.stop_id = s.stop_id);"
         param = []
-    else:
-        sql = "select clusters.stop_id, clusters.stop_name, clusters.stop_lon, clusters.stop_lat, s.stop_id, s.stop_name, s.stop_lon, s.stop_lat from (select stop_id, stop_name, stop_lon, stop_lat from gtfs_stops where ST_DWithin(the_geom, setsrid(makepoint(%s, %s), 4326), %s) and parent_station is null) as clusters, gtfs_stops as s where s.location_type = 0 and (clusters.stop_id = s.parent_station OR clusters.stop_id = s.stop_id);"
-        param = [lon, lat, radius]
     
     cur = conn.cursor()
     cur.execute(sql, param)
@@ -72,10 +75,14 @@ def getTimeTable(stop_id, route_id, operationaldate):
     offset = int(time.mktime(operationaldate.timetuple()))
 
     sql = "select departure_time_seconds from gtfs_trips as t, gtfs_stop_times as st, gtfs_calendar_dates as cd where t.trip_id = st.trip_id and t.service_id = cd.service_id and route_id = %s and stop_id = %s and cd.date = %s order by departure_time;"
+    print operationaldate
     param = [route_id, stop_id, operationaldate]
     cur = conn.cursor()
     cur.execute(sql, param)
     rows = cur.fetchall()
+
+    print
+    print len(rows)
 
     return simplejson.dumps([{'departure_planned': offset + row[0]} for row in rows], sort_keys=True, indent=4)
     
@@ -95,6 +102,7 @@ def getDepartures(stop_id, route_id, maxcount, operationaldate, seconds):
 
         sql = "select departure_time_seconds, st.trip_id||'_'||st.stop_sequence from gtfs_trips as t, gtfs_stop_times as st, gtfs_calendar_dates as cd where t.trip_id = st.trip_id and t.service_id = cd.service_id and route_id = %s and stop_id = %s and cd.date = %s and departure_time_seconds >= %s order by departure_time limit %s;"
         param = [route_id, stop_id, operationaldate, seconds, maxcount]
+        print param
         cur = conn.cursor()
         cur.execute(sql, param)
         rows = cur.fetchall()
@@ -108,7 +116,7 @@ def getDepartures(stop_id, route_id, maxcount, operationaldate, seconds):
             else:
                 actual = offset + actuals[row[1]]
 
-            result["departures"].append({"departure_planned": offset + row[0], "departure_actual": actual})
+            result["departures"].append({"departure_id": row[1], "departure_planned": offset + row[0], "departure_actual": actual})
 
         return simplejson.dumps(result, sort_keys=True, indent=4)
 
@@ -150,14 +158,16 @@ def GVB(environ, start_response):
         
     arguments = url.split('/')
 
-    if arguments[0] == 'getClusters' and (len(arguments) == 1 or len(arguments) == 4):
+    if arguments[0] == 'getClusters' and (len(arguments) == 1 or len(arguments) == 2 or len(arguments) == 4):
         if len(arguments) == 4:
             reply = getClusters(float(arguments[1]), float(arguments[2]), float(arguments[3]))
+        if len(arguments) == 2:
+            reply = getClusters(name=arguments[1])
         elif len(arguments) == 1:
             reply = getClusters()
 
     elif arguments[0] == 'getDepartures' and (len(arguments) == 4):
-        operationaldate, seconds = timestampSplit(int(time.time() - 3600))        
+        operationaldate, seconds = timestampSplit(int(time.time()))        
         reply = getDepartures(arguments[1], arguments[2], arguments[3], operationaldate, seconds)
 
     elif arguments[0] == 'getTimeTable' and (len(arguments) == 4):

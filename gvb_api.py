@@ -7,15 +7,9 @@ import psycopg2
 import time
 import simplejson
 
-# Initialize a zeromq CONTEXT
-context = zmq.Context()
-client_annotate = context.socket(zmq.REQ)
-client_annotate.connect(ZMQ_PUBSUB_KV8_ANNOTATE)
-
 # from const import ZMQ_KV78DEMO
 COMMON_HEADERS = [('Content-Type', 'application/json'), ('Access-Control-Allow-Origin', '*'), ('Access-Control-Allow-Headers', 'Requested-With,Content-Type')]
 
-conn = psycopg2.connect(pg_connect)
 
 def timestampSplit(unixtime):
     dt = datetime.fromtimestamp(unixtime)
@@ -38,6 +32,7 @@ def getClusters(lat=None, lon=None, radius=None, name=None):
         sql = "select clusters.stop_id, clusters.stop_name, clusters.stop_lon, clusters.stop_lat, s.stop_id, s.stop_name, s.stop_lon, s.stop_lat from gtfs_stops as clusters, gtfs_stops as s where clusters.parent_station is null and s.location_type = 0 and (clusters.stop_id = s.parent_station OR clusters.stop_id = s.stop_id);"
         param = []
     
+    conn = psycopg2.connect(pg_connect)
     cur = conn.cursor()
     cur.execute(sql, param)
     rows = cur.fetchall()
@@ -48,6 +43,8 @@ def getClusters(lat=None, lon=None, radius=None, name=None):
 
     cur.execute(sql)
     routes = cur.fetchall()
+    cur.close()
+    conn.close()
 
     stops = {}
     for route in routes:
@@ -74,15 +71,16 @@ def getClusters(lat=None, lon=None, radius=None, name=None):
 def getTimeTable(stop_id, route_id, operationaldate):
     offset = int(time.mktime(operationaldate.timetuple()))
 
-    sql = "select departure_time_seconds from gtfs_trips as t, gtfs_stop_times as st, gtfs_calendar_dates as cd where t.trip_id = st.trip_id and t.service_id = cd.service_id and route_id = %s and stop_id = %s and cd.date = %s order by departure_time;"
+    sql = "select departure_time_seconds from gtfs_trips as t, gtfs_stop_times as st, gtfs_calendar_dates as cd where t.trip_id = st.trip_id and t.service_id = cd.service_id and route_id = %s and stop_id = %s and cd.date = %s and departure_time_seconds is not null order by departure_time;"
     print operationaldate
     param = [route_id, stop_id, operationaldate]
+
+    conn = psycopg2.connect(pg_connect)
     cur = conn.cursor()
     cur.execute(sql, param)
     rows = cur.fetchall()
-
-    print
-    print len(rows)
+    cur.close()
+    conn.close()
 
     return simplejson.dumps([{'departure_planned': offset + row[0]} for row in rows], sort_keys=True, indent=4)
     
@@ -92,23 +90,33 @@ def getDepartures(stop_id, route_id, maxcount, operationaldate, seconds):
     sql = "select gr.agency_id, rd.headsign, gr.route_short_name, description from gtfs_routes as gr, route_destination as rd, route_destination_stops as rds, gtfs_route_types where gr.route_id = rd.route_id and rd.routedest_id = rds.routedest_id and gr.route_type = gtfs_route_types.route_type and rd.route_id = %s and rds.stop_id = %s;"
     
     param = [route_id, stop_id]
+
+    conn = psycopg2.connect(pg_connect)
     cur = conn.cursor()
     cur.execute(sql, param)
     routes = cur.fetchall()
     if len(routes) > 0:
         route = routes[0]
-
-        result = {"line": {"line_id": route_id, "line_company": route[0], "line_destination": route[1], "line_number": route[2], "line_type": route[3]}, "departures": []}
-
+	
+	result = {"line": {"line_id": route_id, "line_company": route[0], "line_destination": route[1], "line_number": route[2], "line_type": route[3]}, "departures": []}
         sql = "select departure_time_seconds, st.trip_id||'_'||st.stop_sequence from gtfs_trips as t, gtfs_stop_times as st, gtfs_calendar_dates as cd where t.trip_id = st.trip_id and t.service_id = cd.service_id and route_id = %s and stop_id = %s and cd.date = %s and departure_time_seconds >= %s order by departure_time limit %s;"
         param = [route_id, stop_id, operationaldate, seconds, maxcount]
         print param
+
+    	conn = psycopg2.connect(pg_connect)
         cur = conn.cursor()
         cur.execute(sql, param)
         rows = cur.fetchall()
+	cur.close()
+    	conn.close()
 
-        client_annotate.send_json([row[1] for row in rows])
-        actuals = client_annotate.recv_json()
+	actuals = {}
+#	if len(rows) > 0:
+#		context = zmq.Context()
+#		client_annotate = context.socket(zmq.REQ)
+#		client_annotate.connect(ZMQ_PUBSUB_KV8_ANNOTATE)
+#		client_annotate.send_json([row[1] for row in rows])
+#		actuals = client_annotate.recv_json()
 
         for row in rows:
             if row[1] not in actuals:
@@ -116,26 +124,38 @@ def getDepartures(stop_id, route_id, maxcount, operationaldate, seconds):
             else:
                 actual = offset + actuals[row[1]]
 
-            result["departures"].append({"departure_id": row[1], "departure_planned": offset + row[0], "departure_actual": actual})
+            result["departures"].append({"departure_id": row[1], "departure_planned": offset + int(row[0]), "departure_actual": actual})
 
         return simplejson.dumps(result, sort_keys=True, indent=4)
-
+    else:
+	cur.close()
+        conn.close()
     return '[]'
 
 def getLineStops(stop_id, route_id, operationaldate, seconds):
     offset = int(time.mktime(operationaldate.timetuple()))
 
-    sql = "select s.stop_id, s.stop_name, s.stop_lon, s.stop_lat, st.departure_time_seconds, st.trip_id||'_'||st.stop_sequence from gtfs_stop_times as st, gtfs_stops as s, gtfs_stop_times as st2 where st.stop_id = s.stop_id and st2.stop_id = %s and st.stop_sequence >= st2.stop_sequence and st.trip_id = st2.trip_id and st.trip_id = (select st.trip_id from gtfs_trips as t, gtfs_stop_times as st, gtfs_calendar_dates as cd, gtfs_stops as s where t.trip_id = st.trip_id and t.service_id = cd.service_id and st.stop_id = s.stop_id and route_id = %s and st.stop_id = %s and cd.date = %s order by abs(departure_time_seconds - %s) limit 1) order by st.stop_sequence;"
+    # sql = "select s.stop_id, s.stop_name, s.stop_lon, s.stop_lat, st.departure_time_seconds, st.trip_id||'_'||st.stop_sequence from gtfs_stop_times as st, gtfs_stops as s, gtfs_stop_times as st2 where st.stop_id = s.stop_id and st2.stop_id = %s and st.stop_sequence >= st2.stop_sequence and st.trip_id = st2.trip_id and st.trip_id = (select st.trip_id from gtfs_trips as t, gtfs_stop_times as st, gtfs_calendar_dates as cd, gtfs_stops as s where t.trip_id = st.trip_id and t.service_id = cd.service_id and st.stop_id = s.stop_id and route_id = %s and st.stop_id = %s and cd.date = %s and departure_time_seconds is not null order by abs(departure_time_seconds - %s) limit 1) order by st.stop_sequence;"
+    sql = "select s.stop_id, s.stop_name, s.stop_lon, s.stop_lat, st.departure_time_seconds, st.trip_id||'_'||st.stop_sequence from gtfs_stop_times as st, gtfs_stops as s, gtfs_stop_times as st2 where st.stop_id = s.stop_id and st2.stop_id = %s and st.stop_sequence >= st2.stop_sequence and st.trip_id = st2.trip_id and st.trip_id = (select st.trip_id from gtfs_trips as t, gtfs_stop_times as st, gtfs_calendar_dates as cd, gtfs_stops as s where t.trip_id = st.trip_id and t.service_id = cd.service_id and st.stop_id = s.stop_id and route_id = %s and st.stop_id = %s and cd.date = %s and st.departure_time_seconds is not null order by abs(departure_time_seconds - %s) limit 1) and st.departure_time_seconds is not null and st2.departure_time_seconds is not null order by st.stop_sequence;"
 
     param = [stop_id, route_id, stop_id, operationaldate, seconds]
+
+    conn = psycopg2.connect(pg_connect)
     cur = conn.cursor()
     cur.execute(sql, param)
     rows = cur.fetchall()
+    cur.close()
+    conn.close()
 
     result = []
 
-    client_annotate.send_json([row[5] for row in rows])
-    actuals = client_annotate.recv_json()
+    actuals = {}
+#    if len(rows) > 0:
+#        context = zmq.Context()
+#        client_annotate = context.socket(zmq.REQ)
+#        client_annotate.connect(ZMQ_PUBSUB_KV8_ANNOTATE)
+#        client_annotate.send_json([row[5] for row in rows])
+#        actuals = client_annotate.recv_json()
 
     for row in rows:
         if row[5] not in actuals:

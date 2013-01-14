@@ -26,7 +26,6 @@ poller.register(client_annotate, zmq.POLLIN)
 
 # Cache
 actuals = {}
-
 while True:
     socks = dict(poller.poll())
 
@@ -36,25 +35,24 @@ while True:
         c = ctx(content)
         if 'DATEDPASSTIME' in c.ctx:
             for row in c.ctx['DATEDPASSTIME'].rows():
-                fid = '_'.join([row['DataOwnerCode'],  row['LinePlanningNumber'], row['LocalServiceLevelCode'], row['JourneyNumber'], row['FortifyOrderNumber'], row['UserStopOrderNumber']])
+		if row['DataOwnerCode'] != 'GVB':
+			continue
+                # fid = '|'.join([row['DataOwnerCode'],  row['LocalServiceLevelCode'], row['LinePlanningNumber'], row['JourneyNumber'], row['FortifyOrderNumber']]) + '_' + row['UserStopOrderNumber']
+                fid = row['JourneyNumber'] + '_' + row['UserStopOrderNumber']
                 hours, minutes, seconds = row['ExpectedDepartureTime'].split(':')
                 departure = ((int(hours) * 60) + int(minutes)) * 60 + int(seconds)
                 actuals[fid] = departure
 
                 #sys.stderr.write('\r%d' % (len(actuals)))
-            print fid
 
     elif socks.get(client_annotate) == zmq.POLLIN:
-        array = client_annotate.recv_json()
-        # print array
+        lookup = client_annotate.recv_json()
         result = {}
-        print '\n\n'
-        for item in array:
-            print item
+        for item in lookup:
+            item = item.split('|')[-1]
             if item in actuals:
+                print item
                 result[item] = actuals[item]
-
-        print '\n\n'
 
         client_annotate.send_json(result)
 
